@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ← Only change vs model.py: source module
-from casa_models import ConvBNSiLU, LEM, ECTB, APH
+from dropped.casa_models import ConvBNSiLU, LEM, ECTB, APH
 
 
 # ──────────────────────────────────────────────────────────────────────────────

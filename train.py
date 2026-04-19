@@ -27,9 +27,9 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.cuda.amp import GradScaler, autocast
 
-from cscga_model import RTDNetClassifier as CSCGA_Model
-from dlem_model import RTDNetClassifier as DLEM_Model
-from casa_model import RTDNetClassifier as CASA_Model
+from dropped.cscga_model import RTDNetClassifier as CSCGA_Model
+from dropped.dlem_model import RTDNetClassifier as DLEM_Model
+from dropped.casa_model import RTDNetClassifier as CASA_Model
 from dataset import get_dataloaders
 
 
