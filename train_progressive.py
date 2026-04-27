@@ -1,19 +1,26 @@
 """
-train_progressive.py  —  Progressive ablation: augmentation + 4 architecture runs
+train_progressive.py  —  Progressive ablation: augmentation + 5 architecture runs
 ===================================================================================
-Runs five configurations in order:
+Runs configurations in order:
 
-    baseline    — rtdnet_slim.py          + NEW training recipe (Mixup/CutMix +
-                                            WarmupCosine + label smoothing 0.15)
-    exp1        — rtdnet_liteaspp.py      + same recipe
-    exp2        — rtdnet_replem.py        + same recipe
-    exp3        — rtdnet_msphead.py       + same recipe
-    all         — rtdnet_msphead.py       (all 3 arch changes, already included)
-                  Note: exp3 == all since msphead already contains liteaspp+replem
+    baseline  — rtdnet_slim.py
+    exp1      — rtdnet_liteaspp.py       (LiteASPP)
+    exp2      — rtdnet_replem.py         (LiteASPP + RepLEM)
+    exp3      — rtdnet_v2.py             (LiteASPP + RepLEM + ECTBPlus
+                                          + LateralFusion + TwoScalePool)
 
-Usage:
+Usage — run only V2:
+    python train_progressive.py --data data/aid --dataset aid --configs exp3
+
+Usage — run full progressive sweep:
     python train_progressive.py --data data/aid --dataset aid
-    python train_progressive.py --data data/aid --configs baseline exp1 exp2 exp3
+
+Usage — 50/50 split (matches your reported result):
+    python train_progressive.py --data data/aid --dataset aid \
+        --train_ratio 0.5 --configs exp3
+
+Resume / compare against existing exp2:
+    python train_progressive.py --data data/aid --configs exp2 exp3
 """
 
 import os, sys, time, json, logging, argparse
@@ -25,12 +32,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torchvision import datasets
 
 # Local imports
 from augmentations import (MixupCutMixCollator, LabelSmoothingLoss,
                             WarmupCosineScheduler, get_strong_transforms)
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 
 # ─── Model registry ───────────────────────────────────────────────────────────
 
@@ -48,39 +58,47 @@ def build_model(config: str, num_classes: int, base_ch: int,
         from rtdnet_replem import RTDNetRepLEM
         return RTDNetRepLEM(num_classes=num_classes, base_ch=base_ch,
                             num_heads=num_heads, C=C, dropout=dropout)
-    elif config in ('exp3', 'all'):
-        from rtdnet_msphead import RTDNetMSPHead
-        return RTDNetMSPHead(num_classes=num_classes, base_ch=base_ch,
-                             num_heads=num_heads, C=C, dropout=dropout)
+    elif config == 'exp3':
+        from rtdnet_v2 import RTDNetV2
+        return RTDNetV2(num_classes=num_classes, base_ch=base_ch,
+                        num_heads=num_heads, C=C, dropout=dropout)
+    elif config == 'exp4':
+        from rtdnet_v3 import RTDNetV3
+        return RTDNetV3(num_classes=num_classes, base_ch=base_ch,
+                        num_heads=num_heads, C=C, dropout=dropout)
+    elif config == 'exp5':
+        from rtdnet_v4 import RTDNetV4
+        return RTDNetV4(num_classes=num_classes, base_ch=base_ch,
+                        num_heads=num_heads, C=C, dropout=dropout)
+    elif config == 'exp6':
+        from rtdnet_v5 import RTDNetV5
+        return RTDNetV5(num_classes=num_classes, base_ch=base_ch,
+                        num_heads=num_heads, C=C, dropout=dropout)
     else:
         raise ValueError(f'Unknown config: {config}')
 
 
 CONFIG_DESC = {
-    'baseline': 'Slim baseline  + new training recipe only',
-    'exp1':     'Slim + LiteASPP            (arch change 1)',
-    'exp2':     'Slim + LiteASPP + RepLEM   (arch change 1+2)',
-    'exp3':     'Slim + LiteASPP + RepLEM + MSPHead (all 3)',
-    'all':      'Slim + LiteASPP + RepLEM + MSPHead (all 3)',
+    'baseline': 'Slim baseline + new training recipe only',
+    'exp1':     'Slim + LiteASPP                        (arch +1)',
+    'exp2':     'Slim + LiteASPP + RepLEM               (arch +2)',
+    'exp3':     'Slim + LiteASPP + RepLEM + ECTBPlus + LateralFusion + TwoScalePool  (arch +3)',
+    'exp4':     'Slim + LiteASPP + RepLEM + ECTBPlus + LateralFusion + TwoScalePool + V3  (arch +4)',
+    'exp5': 'Slim + LiteASPP + RepLEM + ECTBPlus + MultiFPN + APH + TwoScalePool (arch +5)',
+    'exp6': 'Slim + LiteASPP + RepLEM + ECTBPlus + MultiFPN + APH + TwoScalePool (arch +6)',
 }
 
-ALL_CONFIGS = ['baseline', 'exp1', 'exp2', 'exp3']
+ALL_CONFIGS = ['baseline', 'exp1', 'exp2', 'exp3', 'exp4', 'exp5', 'exp6']
 
 
-# ─── Data loading (uses strong transforms) ────────────────────────────────────
+# ─── Data loading ─────────────────────────────────────────────────────────────
 
 def get_dataloaders_strong(root, train_ratio, image_size, batch_size,
                            num_workers, seed, num_classes):
-    """
-    Like dataset.get_dataloaders but uses strong augmentation transforms
-    and the MixupCutMix collator on the train loader.
-    """
     import random
     full_ds = datasets.ImageFolder(root)
-    class_names = full_ds.classes
-    nc = len(class_names)
+    nc      = len(full_ds.classes)
 
-    # Stratified split
     class_indices = {c: [] for c in range(nc)}
     for idx, (_, label) in enumerate(full_ds.samples):
         class_indices[label].append(idx)
@@ -115,7 +133,7 @@ def get_dataloaders_strong(root, train_ratio, image_size, batch_size,
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True)
 
-    return train_loader, val_loader, class_names
+    return train_loader, val_loader, full_ds.classes
 
 
 # ─── Training helpers ─────────────────────────────────────────────────────────
@@ -137,12 +155,11 @@ class AverageMeter:
     def __init__(self): self.reset()
     def reset(self): self.val = self.avg = self.sum = self.count = 0
     def update(self, val, n=1):
-        self.val = val; self.sum += val*n; self.count += n
+        self.val = val; self.sum += val * n; self.count += n
         self.avg  = self.sum / self.count
 
 
 def topk_acc(output, target, topk=(1,)):
-    """Works for both hard (1-D) and soft (2-D) targets."""
     if target.dim() == 2:
         target = target.argmax(dim=1)
     maxk = max(topk); bsz = target.size(0)
@@ -152,15 +169,15 @@ def topk_acc(output, target, topk=(1,)):
             for k in topk]
 
 
-def train_epoch(model, loader, criterion, optimizer, scaler, device,
-                logger, ep, log_every=20):
+def train_epoch(model, loader, criterion, optimizer, scaler,
+                device, logger, ep, log_every=20):
     model.train()
     lm, am = AverageMeter(), AverageMeter()
     for step, (imgs, labels) in enumerate(loader):
         imgs   = imgs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)   # may be soft (2-D)
+        labels = labels.to(device, non_blocking=True)
 
-        with autocast(enabled=scaler is not None):
+        with autocast(device_type=device.type, enabled=scaler is not None):
             logits = model(imgs)
             loss   = criterion(logits, labels)
 
@@ -194,10 +211,8 @@ def validate(model, loader, criterion, device):
         imgs   = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         out    = model(imgs)
-        # validation labels are always hard (not from collator)
         if labels.dim() == 2:
             labels = labels.argmax(dim=1)
-        # use standard CE for val loss reporting
         loss   = F.cross_entropy(out, labels)
         k      = min(5, out.size(1))
         a1, a5 = topk_acc(out, labels, topk=(1, k))
@@ -208,19 +223,21 @@ def validate(model, loader, criterion, device):
     return lm.avg, am1.avg, am5.avg
 
 
-# ─── Single experiment run ────────────────────────────────────────────────────
+# ─── Single experiment ────────────────────────────────────────────────────────
 
 def run_experiment(config, args, train_loader, val_loader,
                    num_classes, save_dir, logger, device):
-    logger.info(f'\n{"="*70}')
-    logger.info(f'  Config : {config}  —  {CONFIG_DESC[config]}')
-    logger.info(f'{"="*70}')
+    logger.info(f'\n{"="*72}')
+    logger.info(f'  Config : {config}')
+    logger.info(f'  Desc   : {CONFIG_DESC[config]}')
+    logger.info(f'{"="*72}')
 
     model = build_model(config, num_classes, args.base_ch,
                         args.num_heads, args.C, args.dropout).to(device)
 
     total = sum(p.numel() for p in model.parameters())
-    logger.info(f'  Params : {total:,}  ({total/1e6:.3f} M)')
+    logger.info(f'  Params : {total:,}  ({total/1e6:.3f} M)  '
+                f'| {total*4/1024**2:.2f} MB')
 
     criterion = LabelSmoothingLoss(num_classes=num_classes,
                                    smoothing=args.label_smoothing)
@@ -235,13 +252,26 @@ def run_experiment(config, args, train_loader, val_loader,
                                       total_epochs=args.epochs,
                                       min_lr=args.min_lr)
 
-    scaler = (GradScaler()
-              if (device.type == 'cuda' and not args.no_amp) else None)
+    scaler = (
+        GradScaler(device=device.type)
+        if (device.type == 'cuda' and not args.no_amp)
+        else None
+    )
 
     best_acc, best_ep, no_imp = 0., 0, 0
+    start_epoch = 1
+
     history = dict(train_loss=[], train_acc=[], val_loss=[], val_acc=[])
 
-    for ep in range(1, args.epochs + 1):
+    if args.resume and os.path.isfile(args.resume):
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt['model_state'])
+        best_acc = ckpt.get('val_acc', 0.0)
+        best_ep = ckpt.get('epoch', 0)
+        start_epoch = best_ep + 1
+        logger.info(f"Resumed from {args.resume} at epoch {best_ep}")
+
+    for ep in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         tr_loss, tr_acc = train_epoch(model, train_loader, criterion,
                                       optimizer, scaler, device, logger, ep)
@@ -264,7 +294,7 @@ def run_experiment(config, args, train_loader, val_loader,
             torch.save(dict(epoch=ep, model_state=model.state_dict(),
                             val_acc=va_acc, config=config),
                        save_dir / f'{config}_best.pt')
-            logger.info(f'  ★ new best {best_acc:.2f}%  (epoch {best_ep})')
+            logger.info(f'   [BEST] new best {best_acc:.2f}%  (epoch {best_ep})')
         else:
             no_imp += 1
 
@@ -276,11 +306,19 @@ def run_experiment(config, args, train_loader, val_loader,
                         f'(best {best_acc:.2f}% @ ep {best_ep})')
             break
 
-    # Reparameterize RepLEM if present
+    # ── Reparameterize if applicable ──────────────────────────────────────────
     if hasattr(model, 'reparameterize'):
         model.reparameterize()
+        # Save inference-ready checkpoint
+        torch.save(dict(epoch=best_ep,
+                        model_state=model.state_dict(),
+                        val_acc=best_acc,
+                        config=config,
+                        reparameterized=True),
+                   save_dir / f'{config}_best_fused.pt')
+        logger.info(f'  Saved fused checkpoint → {config}_best_fused.pt')
 
-    # Inference latency
+    # ── Latency benchmark ─────────────────────────────────────────────────────
     model.eval()
     dummy = torch.randn(1, 3, args.img_size, args.img_size).to(device)
     with torch.no_grad():
@@ -304,12 +342,16 @@ def run_experiment(config, args, train_loader, val_loader,
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--data',            default='data/aid')
+    p = argparse.ArgumentParser(
+        description='RTD-Net progressive architecture ablation trainer')
+    p.add_argument('--data',            default='data/aid',
+                   help='Path to dataset root (ImageFolder structure)')
     p.add_argument('--dataset',         default='aid',
                    choices=['aid', 'nwpu'])
-    p.add_argument('--num_classes',     type=int,   default=None)
-    p.add_argument('--train_ratio',     type=float, default=0.8)
+    p.add_argument('--num_classes',     type=int,   default=None,
+                   help='Override class count (auto-detected if omitted)')
+    p.add_argument('--train_ratio',     type=float, default=0.5,
+                   help='Train split fraction. 0.5 = 50/50, 0.8 = 80/20')
     p.add_argument('--img_size',        type=int,   default=640)
     p.add_argument('--base_ch',         type=int,   default=32)
     p.add_argument('--num_heads',       type=int,   default=4)
@@ -324,13 +366,16 @@ def main():
     p.add_argument('--weight_decay',    type=float, default=0.0005)
     p.add_argument('--label_smoothing', type=float, default=0.15)
     p.add_argument('--patience',        type=int,   default=60)
-    p.add_argument('--configs',         nargs='+',  default=ALL_CONFIGS,
-                   choices=ALL_CONFIGS + ['all'],
-                   help='Which experiments to run (default: all 4)')
+    p.add_argument('--configs',         nargs='+',  default=['exp3'],
+                   choices=ALL_CONFIGS,
+                   help='Which experiments to run. Default: exp3 only')
     p.add_argument('--num_workers',     type=int,   default=4)
     p.add_argument('--seed',            type=int,   default=42)
     p.add_argument('--save_dir',        default='runs/progressive')
-    p.add_argument('--no_amp',          action='store_true')
+    p.add_argument('--no_amp',          action='store_true',
+                   help='Disable automatic mixed precision')
+    p.add_argument('--resume', type=str, default='',
+               help='Path to checkpoint to resume from')
     args = p.parse_args()
 
     save_dir = (Path(args.save_dir) /
@@ -338,11 +383,14 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(save_dir)
 
-    logger.info('=' * 70)
-    logger.info('  Progressive Experiment: augmentation → arch changes')
-    logger.info('  Training recipe: Mixup+CutMix, LabelSmooth=0.15, '
-                'WarmupCosine, RandomErasing')
-    logger.info('=' * 70)
+    logger.info('=' * 72)
+    logger.info('  RTD-Net Progressive Ablation Trainer')
+    logger.info(f'  Configs      : {args.configs}')
+    logger.info(f'  Train ratio  : {args.train_ratio}')
+    logger.info(f'  Label smooth : {args.label_smoothing}')
+    logger.info(f'  Epochs       : {args.epochs}  patience={args.patience}')
+    logger.info(f'  Img size     : {args.img_size}')
+    logger.info('=' * 72)
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -351,21 +399,14 @@ def main():
     logger.info(f'  Device : {device}')
 
     if not os.path.isdir(args.data):
-        logger.error(f'Dataset not found: {args.data}')
+        logger.error(f'Dataset directory not found: {args.data}')
         sys.exit(1)
 
-    # Quick class count
     tmp_ds      = datasets.ImageFolder(args.data)
     num_classes = args.num_classes or len(tmp_ds.classes)
     del tmp_ds
+    logger.info(f'  Classes : {num_classes}')
 
-    logger.info(f'  Classes     : {num_classes}')
-    logger.info(f'  Label smooth: {args.label_smoothing}')
-    logger.info(f'  Warmup eps  : {args.warmup_epochs}')
-    logger.info(f'  Max epochs  : {args.epochs}')
-    logger.info(f'  Patience    : {args.patience}')
-
-    # Build dataloaders once — reused across all configs
     train_loader, val_loader, class_names = get_dataloaders_strong(
         root=args.data, train_ratio=args.train_ratio,
         image_size=args.img_size, batch_size=args.batch_size,
@@ -381,22 +422,22 @@ def main():
                            num_classes, save_dir, logger, device)
         results.append(r)
 
-    # ── Final comparison table ─────────────────────────────────────────────────
-    logger.info('\n' + '=' * 70)
-    logger.info('  PROGRESSIVE EXPERIMENT RESULTS')
-    logger.info('=' * 70)
+    # ── Summary table ─────────────────────────────────────────────────────────
+    logger.info('\n' + '=' * 72)
+    logger.info('  RESULTS')
+    logger.info('=' * 72)
     logger.info(f"  {'Config':<12} {'Acc%':>7} {'ΔAcc':>7} "
                 f"{'Params(M)':>10} {'MB':>6} {'InfMS':>7} {'FPS':>6}")
-    logger.info('-' * 70)
+    logger.info('-' * 72)
 
     baseline_acc = next(
         (r['best_val_acc'] for r in results if r['config'] == 'baseline'),
         None)
 
     for r in results:
-        delta  = (r['best_val_acc'] - baseline_acc
+        delta  = ((r['best_val_acc'] - baseline_acc)
                   if baseline_acc is not None else 0.0)
-        marker = ('  ★' if r['best_val_acc'] ==
+        marker = ('   [TOP]' if r['best_val_acc'] ==
                   max(x['best_val_acc'] for x in results) else '')
         logger.info(
             f"  {r['config']:<12} {r['best_val_acc']:>7.2f} "
@@ -404,11 +445,12 @@ def main():
             f"{r['size_MB']:>6.2f} {r['inf_ms']:>7.2f} "
             f"{r['fps']:>6.1f}{marker}")
 
-    logger.info('=' * 70)
+    logger.info('=' * 72)
 
-    with open(save_dir / 'progressive_results.json', 'w') as f:
-        json.dump(dict(results=results, settings=vars(args)), f, indent=2)
-    logger.info(f'  Saved to: {save_dir}')
+    summary = dict(results=results, settings=vars(args))
+    with open(save_dir / 'results.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f'  Saved → {save_dir / "results.json"}')
 
 
 if __name__ == '__main__':
